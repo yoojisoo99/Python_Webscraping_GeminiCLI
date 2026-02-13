@@ -1,156 +1,145 @@
+
 import requests
 from bs4 import BeautifulSoup
+import pandas as pd
 from loguru import logger
-# import koreanize_matplotlib # Temporarily commented out due to ModuleNotFoundError: No module named 'distutils'
+import os
+import re
+import time
 
-# Configure loguru as per GEMINI.md
-logger.add("file_{time}.log", rotation="500 MB")
+# --- Configuration ---
+LOG_DIR = "yes24/log"
+DATA_DIR = "yes24/data"
+CSV_PATH = os.path.join(DATA_DIR, "yes24_ai.csv")
 
-class Yes24Scraper:
-    def __init__(self):
-        self.base_url = "https://www.yes24.com/product/category/CategoryProductContents"
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Whale/4.35.351.16 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp, Selene;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
-            "Cache-Control": "max-age=0",
-            "Connection": "keep-alive",
-            "Host": "www.yes24.com",
-            "Referer": "https://www.yes24.com/product/category/display/001001003032",
-            "sec-ch-ua": '"Chromium";v="142", "Whale";v="4", "Not.A/Brand";v="99"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "Upgrade-Insecure-Requests": "1",
-            "X-Requested-With": "XMLHttpRequest"
-        }
-        self.params = {
-            "dispNo": "001001003032",
-            "order": "SINDEX_ONLY",
-            "addOptionTp": "0",
-            "page": 1,  # Start with page 1
-            "size": 24,
-            "statGbYn": "N",
-            "viewMode": "",
-            "_options": "",
-            "directDelvYn": "",
-            "usedTp": "0",
-            "elemNo": "0",
-            "elemSeq": "0",
-            "seriesNumber": "0"
-        }
+# --- Setup Directories ---
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
-    def fetch_page(self, page_num):
-        self.params["page"] = page_num
-        try:
-            response = requests.get(self.base_url, headers=self.headers, params=self.params)
-            response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
-            logger.info(f"Successfully fetched page {page_num}")
-            return response.text
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching page {page_num}: {e}")
-            return None
+# --- Logger Setup ---
+logger.add(os.path.join(LOG_DIR, "scraper_{time}.log"), rotation="500 MB")
 
-    def parse_book_data(self, html_content):
-        soup = BeautifulSoup(html_content, 'html.parser')
-        book_list = []
+# --- Scraping Constants ---
+BASE_URL = "https://www.yes24.com/product/category/CategoryProductContents"
+HEADERS = {
+    'Referer': 'https://www.yes24.com/product/category/display/001001003032',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Whale/4.35.351.16 Safari/537.36',
+    'X-Requested-With': 'XMLHttpRequest'
+}
+BASE_PARAMS = {
+    'dispNo': '001001003032',
+    'order': 'SINDEX_ONLY',
+    'size': 24,
+}
+
+def get_text_or_none(element, selector):
+    """Safely find an element and return its text, or None if not found."""
+    found = element.select_one(selector)
+    return found.get_text(strip=True) if found else None
+
+def parse_price(price_str):
+    """Remove commas and convert to integer."""
+    if price_str:
+        return int(re.sub(r',', '', price_str))
+    return 0
+
+def parse_review_count(review_str):
+    """Extract number from review count string like '(21건)'."""
+    if review_str:
+        match = re.search(r'\((\d+)\)', review_str)
+        if match:
+            return int(match.group(1))
+    return 0
+
+def get_book_data(item):
+    """Extracts all necessary data from a single book item."""
+    title = get_text_or_none(item, 'a.gd_name')
+    author = get_text_or_none(item, 'span.info_auth > a')
+    publisher = get_text_or_none(item, 'span.info_pub > a')
+    publication_date = get_text_or_none(item, 'span.info_date')
+
+    sales_price_str = get_text_or_none(item, 'strong.txt_num > em.yes_b')
+    original_price_str = get_text_or_none(item, 'span.txt_num.dash > em.yes_m')
+    sales_price = parse_price(sales_price_str)
+    original_price = parse_price(original_price_str)
+
+    rating_str = get_text_or_none(item, 'span.rating_grade > em.yes_b')
+    rating = float(rating_str) if rating_str else 0.0
+
+    review_count_str = get_text_or_none(item, 'span.rating_rvCount')
+    review_count = parse_review_count(review_count_str)
+
+
+    if not title:
+        return None
+
+    return {
+        'title': title,
+        'author': author,
+        'publisher': publisher,
+        'publication_date': publication_date,
+        'sales_price': sales_price,
+        'original_price': original_price,
+        'rating': rating,
+        'review_count': review_count,
+    }
+
+
+def scrape_yes24(pages_to_scrape=3):
+    """Scrapes the specified number of pages from Yes24."""
+    all_books = []
+    logger.info(f"Starting to scrape {pages_to_scrape} pages.")
+
+    for page in range(1, pages_to_scrape + 1):
+        params = BASE_PARAMS.copy()
+        params['page'] = page
         
-        items = soup.find_all('div', class_='itemUnit')
-        for item in items:
-            title = item.find('a', class_='gd_name').text.strip() if item.find('a', class_='gd_name') else 'N/A'
+        try:
+            response = requests.get(BASE_URL, headers=HEADERS, params=params, timeout=10)
+            response.raise_for_status()
+            response.encoding = 'utf-8'
+            logger.info(f"Successfully fetched page {page}. Status: {response.status_code}")
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            items = soup.select('div.itemUnit')
+
+            if not items:
+                logger.warning(f"No items found on page {page}. Stopping.")
+                break
+
+            for item in items:
+                book_data = get_book_data(item)
+                if book_data:
+                    all_books.append(book_data)
             
-            # Author and Publisher are in the same div, separated by '저'
-            author_publisher_info = item.find('div', class_='info_pubGrp')
-            author = 'N/A'
-            publisher = 'N/A'
-            if author_publisher_info:
-                author_span = author_publisher_info.find('span', class_='info_auth')
-                if author_span:
-                    author_a = author_span.find('a')
-                    author = author_a.text.strip() if author_a else author_span.text.replace('저', '').strip()
-                
-                publisher_span = author_publisher_info.find('span', class_='info_pub')
-                if publisher_span:
-                    publisher_a = publisher_span.find('a')
-                    publisher = publisher_a.text.strip() if publisher_a else publisher_span.text.strip()
+            # Be a good web citizen
+            time.sleep(1) 
 
-            pub_date = item.find('span', class_='info_date').text.strip() if item.find('span', class_='info_date') else 'N/A'
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch page {page}. Error: {e}")
+            break
             
-            # Price extraction
-            price_info = item.find('div', class_='info_price')
-            sales_price = 'N/A'
-            original_price = 'N/A'
-            if price_info:
-                sales_price_em = price_info.find('strong', class_='txt_num').find('em', class_='yes_b')
-                if sales_price_em:
-                    sales_price = sales_price_em.text.replace(',', '').strip()
-
-                original_price_em = price_info.find('span', class_='txt_num dash')
-                if original_price_em:
-                    original_price = original_price_em.find('em', class_='yes_m').text.replace(',', '').strip()
-
-            # Rating extraction
-            rating_info = item.find('div', class_='info_rating')
-            rating = 'N/A'
-            review_count = 'N/A'
-            if rating_info:
-                rating_grade_span = rating_info.find('span', class_='rating_grade')
-                if rating_grade_span:
-                    rating_em = rating_grade_span.find('em', class_='yes_b')
-                    if rating_em:
-                        rating = rating_em.text.strip()
-                
-                review_count_span = rating_info.find('span', class_='rating_rvCount')
-                if review_count_span:
-                    review_count_a = review_count_span.find('a')
-                    if review_count_a:
-                        review_count = review_count_a.text.replace('회원리뷰(', '').replace('건)', '').strip()
-
-            book_list.append({
-                'title': title,
-                'author': author,
-                'publisher': publisher,
-                'publication_date': pub_date,
-                'sales_price': sales_price,
-                'original_price': original_price,
-                'rating': rating,
-                'review_count': review_count
-            })
-        return book_list
-
-    def scrape_pages(self, num_pages=1):
-        all_books = []
-        for page in range(1, num_pages + 1):
-            logger.info(f"Scraping page {page}...")
-            html_content = self.fetch_page(page)
-            if html_content:
-                books_on_page = self.parse_book_data(html_content)
-                all_books.extend(books_on_page)
-                logger.info(f"Found {len(books_on_page)} books on page {page}")
-        return all_books
+    logger.info(f"Finished scraping. Total books found: {len(all_books)}")
+    return all_books
 
 if __name__ == "__main__":
-    scraper = Yes24Scraper()
-    # Scrape 2 pages as an example
-    scraped_books = scraper.scrape_pages(num_pages=2)
+    PAGES_TO_SCRAPE = 5  # Scrape the first 5 pages
     
-    if scraped_books:
-        # Save to CSV
-        import pandas as pd
-        import os
+    books_list = scrape_yes24(pages_to_scrape=PAGES_TO_SCRAPE)
 
-        output_dir = "yes24/data"
-        os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, "yes24_ai.csv")
+    if books_list:
+        df = pd.DataFrame(books_list)
+        
+        # Ensure all columns are present
+        all_cols = ['title', 'author', 'publisher', 'publication_date', 'sales_price', 'original_price', 'rating', 'review_count']
+        for col in all_cols:
+            if col not in df.columns:
+                df[col] = None
 
-        df = pd.DataFrame(scraped_books)
-        df.to_csv(output_file, index=False, encoding='utf-8-sig')
-        logger.info(f"Scraped data saved to {output_file}")
+        df = df[all_cols] # Reorder columns
 
-        for book in scraped_books:
-            logger.info(book)
-        logger.info(f"Total books scraped: {len(scraped_books)}")
+        df.to_csv(CSV_PATH, index=False, encoding='utf-8-sig')
+        logger.info(f"Successfully saved {len(df)} books to {CSV_PATH}")
     else:
-        logger.warning("No books were scraped.")
+        logger.warning("No books were scraped. CSV file not created.")
+
